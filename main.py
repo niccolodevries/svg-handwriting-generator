@@ -11,7 +11,7 @@ import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-from engine import HandwritingRenderer, generate_svg, generate_lac
+from engine import HandwritingRenderer, generate_svg, generate_lac, generate_pdf
 
 PREVIEW_PADDING = 20
 
@@ -29,6 +29,7 @@ class HandwritingApp:
         self._page_h = 297.0
         self._rendering = False
         self._model_ready = False
+        self._zoom = None  # None means auto fit-to-width
 
         self._build_ui()
         self._preload_model()
@@ -59,12 +60,12 @@ class HandwritingApp:
         style_frame = ttk.Frame(settings)
         style_frame.pack(fill=tk.X, pady=2)
         ttk.Label(style_frame, text='Handwriting style:').pack(side=tk.LEFT)
-        self.style_var = tk.IntVar(value=9)
+        self.style_var = tk.IntVar(value=1)
         style_spin = ttk.Spinbox(style_frame, from_=0, to=12, textvariable=self.style_var, width=4)
         style_spin.pack(side=tk.RIGHT)
 
         # Bias (neatness)
-        self.bias_var = tk.DoubleVar(value=0.75)
+        self.bias_var = tk.DoubleVar(value=0.80)
         self._add_slider(settings, 'Neatness (bias):', self.bias_var, 0.0, 1.5, 0.05)
 
         # Scale
@@ -84,7 +85,7 @@ class HandwritingApp:
         cpl_spin.pack(side=tk.RIGHT)
 
         # Stroke width
-        self.stroke_width_var = tk.DoubleVar(value=0.4)
+        self.stroke_width_var = tk.DoubleVar(value=0.25)
         self._add_slider(settings, 'Stroke width (mm):', self.stroke_width_var, 0.1, 1.5, 0.05)
 
         # Color
@@ -103,6 +104,8 @@ class HandwritingApp:
         self.generate_btn.pack(fill=tk.X, pady=2)
         ttk.Button(btn_frame, text='Export SVG...',
                    command=self._export_svg).pack(fill=tk.X, pady=2)
+        ttk.Button(btn_frame, text='Export PDF...',
+                   command=self._export_pdf).pack(fill=tk.X, pady=2)
         ttk.Button(btn_frame, text='Export LAC (Bambu Suite)...',
                    command=self._export_lac).pack(fill=tk.X, pady=2)
 
@@ -115,12 +118,39 @@ class HandwritingApp:
         right = ttk.Frame(paned)
         paned.add(right, weight=1)
 
-        ttk.Label(right, text='Preview (A4)', font=('', 11, 'bold')).pack(
-            anchor='w', padx=8, pady=(8, 2))
+        header = ttk.Frame(right)
+        header.pack(fill=tk.X, padx=8, pady=(8, 2))
+        ttk.Label(header, text='Preview (A4)', font=('', 11, 'bold')).pack(side=tk.LEFT)
+        self._zoom_label = ttk.Label(header, text='', foreground='gray')
+        self._zoom_label.pack(side=tk.RIGHT)
+        ttk.Button(header, text='Fit', width=4,
+                   command=self._zoom_fit).pack(side=tk.RIGHT, padx=(0, 4))
 
-        self.canvas = tk.Canvas(right, bg='#e0e0e0', highlightthickness=0)
-        self.canvas.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+        canvas_frame = ttk.Frame(right)
+        canvas_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+
+        self.canvas = tk.Canvas(canvas_frame, bg='#e0e0e0', highlightthickness=0)
+        self._vscroll = ttk.Scrollbar(canvas_frame, orient=tk.VERTICAL,
+                                      command=self.canvas.yview)
+        self._hscroll = ttk.Scrollbar(canvas_frame, orient=tk.HORIZONTAL,
+                                      command=self.canvas.xview)
+        self.canvas.configure(xscrollcommand=self._hscroll.set,
+                              yscrollcommand=self._vscroll.set)
+
+        self.canvas.grid(row=0, column=0, sticky='nsew')
+        self._vscroll.grid(row=0, column=1, sticky='ns')
+        self._hscroll.grid(row=1, column=0, sticky='ew')
+        canvas_frame.grid_rowconfigure(0, weight=1)
+        canvas_frame.grid_columnconfigure(0, weight=1)
+
         self.canvas.bind('<Configure>', self._on_canvas_resize)
+        # Scroll-wheel zoom
+        self.canvas.bind('<MouseWheel>', self._on_scroll_zoom)           # macOS / Windows
+        self.canvas.bind('<Button-4>', self._on_scroll_zoom)             # Linux scroll up
+        self.canvas.bind('<Button-5>', self._on_scroll_zoom)             # Linux scroll down
+        # Click-drag panning
+        self.canvas.bind('<ButtonPress-1>', self._on_pan_start)
+        self.canvas.bind('<B1-Motion>', self._on_pan_move)
 
     def _add_slider(self, parent, label, var, from_, to, resolution):
         frame = ttk.Frame(parent)
@@ -195,56 +225,90 @@ class HandwritingApp:
         self.status_var.set(f'Error: {msg}')
         messagebox.showerror('Render Error', msg)
 
+    def _get_preview_scale(self):
+        """Return the current zoom scale (pixels per mm)."""
+        cw = self.canvas.winfo_width()
+        if cw < 10:
+            return 1.0
+        pw = self._page_w
+        if self._zoom is None:
+            # Fit to width by default
+            return (cw - 2 * PREVIEW_PADDING) / pw
+        return self._zoom
+
     def _on_canvas_resize(self, event=None):
+        if self._zoom is None:
+            # Re-fit when in auto mode
+            pass
         if self._polylines:
             self._draw_preview()
         elif self._model_ready:
             self._draw_empty_page()
 
-    def _draw_empty_page(self):
-        """Draw an empty A4 page on the canvas."""
-        self.canvas.delete('all')
-        cw = self.canvas.winfo_width()
-        ch = self.canvas.winfo_height()
-        if cw < 10 or ch < 10:
-            return
+    def _on_scroll_zoom(self, event):
+        # Determine scroll direction
+        if event.num == 4:
+            delta = 1
+        elif event.num == 5:
+            delta = -1
+        else:
+            delta = event.delta
 
-        pw, ph = 210.0, 297.0
-        scale_x = (cw - 2 * PREVIEW_PADDING) / pw
-        scale_y = (ch - 2 * PREVIEW_PADDING) / ph
-        scale = min(scale_x, scale_y)
+        factor = 1.15 if delta > 0 else 1 / 1.15
+        old_scale = self._get_preview_scale()
+        new_scale = old_scale * factor
+        # Clamp to reasonable range (0.5x to 20x pixels per mm)
+        new_scale = max(0.5, min(20.0, new_scale))
+        self._zoom = new_scale
+        self._draw_preview() if self._polylines else self._draw_empty_page()
 
-        ox = (cw - pw * scale) / 2
-        oy = (ch - ph * scale) / 2
+    def _zoom_fit(self):
+        self._zoom = None
+        self._draw_preview() if self._polylines else self._draw_empty_page()
+
+    def _on_pan_start(self, event):
+        self.canvas.scan_mark(event.x, event.y)
+
+    def _on_pan_move(self, event):
+        self.canvas.scan_dragto(event.x, event.y, gain=1)
+
+    def _draw_page(self, scale, pw, ph):
+        """Draw the page background, shadow, and margins at the given scale."""
+        ox = PREVIEW_PADDING
+        oy = PREVIEW_PADDING
 
         self.canvas.create_rectangle(ox + 3, oy + 3, ox + pw*scale + 3, oy + ph*scale + 3,
                                      fill='#aaa', outline='')
         self.canvas.create_rectangle(ox, oy, ox + pw*scale, oy + ph*scale,
                                      fill='white', outline='#999')
+        return ox, oy
+
+    def _draw_empty_page(self):
+        """Draw an empty A4 page on the canvas."""
+        self.canvas.delete('all')
+        pw, ph = 210.0, 297.0
+        scale = self._get_preview_scale()
+
+        total_w = pw * scale + 2 * PREVIEW_PADDING
+        total_h = ph * scale + 2 * PREVIEW_PADDING
+        self.canvas.configure(scrollregion=(0, 0, total_w, total_h))
+
+        self._draw_page(scale, pw, ph)
+        self._zoom_label.config(text=f'{scale / ((self.canvas.winfo_width() - 2 * PREVIEW_PADDING) / pw) * 100:.0f}%')
 
     def _draw_preview(self):
         if not hasattr(self, '_polylines'):
             return
 
         self.canvas.delete('all')
-        cw = self.canvas.winfo_width()
-        ch = self.canvas.winfo_height()
-        if cw < 10 or ch < 10:
-            return
-
         pw, ph = self._page_w, self._page_h
-        scale_x = (cw - 2 * PREVIEW_PADDING) / pw
-        scale_y = (ch - 2 * PREVIEW_PADDING) / ph
-        scale = min(scale_x, scale_y)
+        scale = self._get_preview_scale()
 
-        ox = (cw - pw * scale) / 2
-        oy = (ch - ph * scale) / 2
+        total_w = pw * scale + 2 * PREVIEW_PADDING
+        total_h = ph * scale + 2 * PREVIEW_PADDING
+        self.canvas.configure(scrollregion=(0, 0, total_w, total_h))
 
-        # Page shadow + background
-        self.canvas.create_rectangle(ox + 3, oy + 3, ox + pw*scale + 3, oy + ph*scale + 3,
-                                     fill='#aaa', outline='')
-        self.canvas.create_rectangle(ox, oy, ox + pw*scale, oy + ph*scale,
-                                     fill='white', outline='#999')
+        ox, oy = self._draw_page(scale, pw, ph)
 
         # Margin guides
         renderer = self._get_renderer()
@@ -268,6 +332,8 @@ class HandwritingApp:
             self.canvas.create_line(*coords, fill=color, width=sw,
                                     smooth=False, capstyle='round', joinstyle='round')
 
+        self._zoom_label.config(text=f'{scale / ((self.canvas.winfo_width() - 2 * PREVIEW_PADDING) / pw) * 100:.0f}%')
+
     def _export_svg(self):
         if not self._svg_paths:
             messagebox.showinfo('No Data', 'Generate handwriting first.')
@@ -287,6 +353,25 @@ class HandwritingApp:
                 f.write(svg_content)
             messagebox.showinfo('Exported', f'SVG saved to:\n{path}')
 
+
+    def _export_pdf(self):
+        if not self._svg_paths:
+            messagebox.showinfo('No Data', 'Generate handwriting first.')
+            return
+
+        path = filedialog.asksaveasfilename(
+            title='Save PDF',
+            defaultextension='.pdf',
+            filetypes=[('PDF files', '*.pdf'), ('All files', '*.*')],
+        )
+        if path:
+            try:
+                generate_pdf(self._svg_paths, path,
+                             getattr(self, '_render_color', '#1a1a2e'),
+                             getattr(self, '_render_stroke_width', 0.4))
+                messagebox.showinfo('Exported', f'PDF saved to:\n{path}')
+            except Exception as e:
+                messagebox.showerror('Export Error', str(e))
 
     def _export_lac(self):
         if not self._svg_paths:
@@ -308,6 +393,12 @@ class HandwritingApp:
 
 def main():
     root = tk.Tk()
+
+    # Enable Retina / HiDPI rendering on macOS
+    if sys.platform == 'darwin':
+        dpi_scale = root.winfo_fpixels('1i') / 72.0
+        root.tk.call('tk', 'scaling', dpi_scale)
+
     HandwritingApp(root)
     root.mainloop()
 

@@ -95,7 +95,7 @@ def wrap_text(text, max_chars=60):
 class HandwritingRenderer:
     """Renders text as realistic handwriting using a neural network."""
 
-    def __init__(self, style=9, bias=0.75, stroke_width=0.4,
+    def __init__(self, style=1, bias=0.80, stroke_width=0.25,
                  color='#1a1a2e', scale=1.0, line_spacing=1.0,
                  max_chars_per_line=60, margins=None):
         self.style = style
@@ -142,11 +142,9 @@ class HandwritingRenderer:
         polylines = []
 
         usable_w = A4_WIDTH - self.margins['left'] - self.margins['right']
-        usable_h = A4_HEIGHT - self.margins['top'] - self.margins['bottom']
 
         # Base line height in mm (tuned for readable handwriting)
         base_line_height = 8.0 * self.scale * self.line_spacing
-        total_lines = len(lines)
 
         for data_idx, offsets in enumerate(stroke_data):
             page_line_idx = line_indices[data_idx]
@@ -231,6 +229,90 @@ def generate_svg(svg_paths, color='#1a1a2e', stroke_width=0.4):
 
     lines.append('</svg>')
     return '\n'.join(lines)
+
+
+def generate_pdf(svg_paths, output_path, color='#1a1a2e', stroke_width=0.4):
+    """Generate a PDF file with the handwriting paths.
+
+    Produces a minimal valid PDF directly — no external libraries needed.
+    """
+    # Convert mm to PDF points (1 mm = 72/25.4 points)
+    mm2pt = 72.0 / 25.4
+    page_w = A4_WIDTH * mm2pt
+    page_h = A4_HEIGHT * mm2pt
+
+    # Parse hex color to RGB (0-1 range)
+    c = color.lstrip('#')
+    r, g, b = int(c[0:2], 16) / 255, int(c[2:4], 16) / 255, int(c[4:6], 16) / 255
+
+    # Build PDF content stream — draw all paths
+    stream_parts = [
+        # Set stroke color, width, line caps/joins
+        f'{r:.4f} {g:.4f} {b:.4f} RG',
+        f'{stroke_width * mm2pt:.4f} w',
+        '1 J',  # round line cap
+        '1 j',  # round line join
+    ]
+
+    for path_d in svg_paths:
+        if not path_d:
+            continue
+        for part in path_d.split():
+            if part.startswith('M'):
+                coords = part[1:].split(',')
+                # PDF Y-axis is bottom-up, so flip: pdf_y = page_h - svg_y * mm2pt
+                x = float(coords[0]) * mm2pt
+                y = page_h - float(coords[1]) * mm2pt
+                stream_parts.append(f'{x:.4f} {y:.4f} m')
+            elif part.startswith('L'):
+                coords = part[1:].split(',')
+                x = float(coords[0]) * mm2pt
+                y = page_h - float(coords[1]) * mm2pt
+                stream_parts.append(f'{x:.4f} {y:.4f} l')
+        stream_parts.append('S')  # stroke the path
+
+    stream = '\n'.join(stream_parts)
+    stream_bytes = stream.encode('latin-1')
+
+    # Build minimal PDF structure
+    objects = []
+
+    # Object 1: Catalog
+    objects.append(b'1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj')
+    # Object 2: Pages
+    objects.append(b'2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj')
+    # Object 3: Page
+    objects.append(
+        f'3 0 obj\n<< /Type /Page /Parent 2 0 R '
+        f'/MediaBox [0 0 {page_w:.4f} {page_h:.4f}] '
+        f'/Contents 4 0 R >>\nendobj'.encode('latin-1')
+    )
+    # Object 4: Content stream
+    objects.append(
+        f'4 0 obj\n<< /Length {len(stream_bytes)} >>\nstream\n'.encode('latin-1')
+        + stream_bytes
+        + b'\nendstream\nendobj'
+    )
+
+    # Write PDF
+    with open(output_path, 'wb') as f:
+        f.write(b'%PDF-1.4\n')
+        offsets = []
+        for obj in objects:
+            offsets.append(f.tell())
+            f.write(obj)
+            f.write(b'\n')
+        # Cross-reference table
+        xref_offset = f.tell()
+        f.write(f'xref\n0 {len(objects) + 1}\n'.encode('latin-1'))
+        f.write(b'0000000000 65535 f \n')
+        for off in offsets:
+            f.write(f'{off:010d} 00000 n \n'.encode('latin-1'))
+        # Trailer
+        f.write(
+            f'trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n'
+            f'startxref\n{xref_offset}\n%%EOF\n'.encode('latin-1')
+        )
 
 
 def _svg_path_to_lac_path(svg_path_d):
