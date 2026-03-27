@@ -9,6 +9,7 @@ Powered by a recurrent neural network trained on real handwriting samples.
 - **Neural handwriting synthesis** — generates realistic, human-like handwriting using an RNN
 - **13 handwriting styles** — choose from different writer personalities (styles 0-12)
 - **Plotter-ready SVG** — all strokes are single continuous paths with no fills, perfect for pen plotters
+- **Direct Bambu Suite export** — export `.lac` files that open directly in Bambu Suite for the H2D pen plotter, no SVG import step needed
 - **A4 page layout** — proper margins, word wrapping, and line spacing
 - **GUI with live preview** — see the rendered handwriting before exporting
 - **Configurable** — adjust neatness (bias), scale, line spacing, stroke width, and ink color
@@ -35,7 +36,7 @@ This opens the GUI where you can:
 1. Type or paste your text
 2. Choose a handwriting style and adjust settings
 3. Click **Generate Handwriting** to render
-4. Click **Export SVG** to save the A4-sized SVG file
+4. Click **Export SVG** to save the A4-sized SVG file, or **Export LAC (Bambu Suite)** to save a `.lac` project file that can be opened directly in Bambu Suite for the H2D
 
 ## Project Structure
 
