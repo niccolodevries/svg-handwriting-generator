@@ -11,7 +11,7 @@ import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-from engine import HandwritingRenderer, generate_svg
+from engine import HandwritingRenderer, generate_svg, generate_lac
 
 PREVIEW_PADDING = 20
 
@@ -103,6 +103,8 @@ class HandwritingApp:
         self.generate_btn.pack(fill=tk.X, pady=2)
         ttk.Button(btn_frame, text='Export SVG...',
                    command=self._export_svg).pack(fill=tk.X, pady=2)
+        ttk.Button(btn_frame, text='Export LAC (Bambu Suite)...',
+                   command=self._export_lac).pack(fill=tk.X, pady=2)
 
         # Status
         self.status_var = tk.StringVar(value='Loading neural network model...')
@@ -284,6 +286,24 @@ class HandwritingApp:
             with open(path, 'w', encoding='utf-8') as f:
                 f.write(svg_content)
             messagebox.showinfo('Exported', f'SVG saved to:\n{path}')
+
+
+    def _export_lac(self):
+        if not self._svg_paths:
+            messagebox.showinfo('No Data', 'Generate handwriting first.')
+            return
+
+        path = filedialog.asksaveasfilename(
+            title='Save LAC (Bambu Suite)',
+            defaultextension='.lac',
+            filetypes=[('Bambu Suite files', '*.lac'), ('All files', '*.*')],
+        )
+        if path:
+            try:
+                generate_lac(self._svg_paths, path)
+                messagebox.showinfo('Exported', f'LAC saved to:\n{path}')
+            except Exception as e:
+                messagebox.showerror('Export Error', str(e))
 
 
 def main():
