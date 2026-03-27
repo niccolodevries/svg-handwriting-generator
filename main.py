@@ -23,13 +23,12 @@ class HandwritingApp:
         self.root.geometry('1100x750')
         self.root.minsize(900, 600)
 
-        self._svg_paths = []
-        self._polylines = []
+        self._pages = []  # list of {'svg_paths': [...], 'polylines': [...]}
+        self._current_page = 0
         self._page_w = 210.0
         self._page_h = 297.0
         self._rendering = False
         self._model_ready = False
-        self._zoom = None  # None means auto fit-to-width
 
         self._build_ui()
         self._preload_model()
@@ -50,6 +49,9 @@ class HandwritingApp:
             'Pack my box with five dozen liquor jugs!\n\n'
             'Handwriting synthesis using a recurrent neural network.'
         )
+
+        ttk.Label(left, text='Use --- on its own line to force a page break.',
+                 foreground='gray', font=('', 9)).pack(anchor='w', padx=8, pady=(0, 4))
 
         ttk.Separator(left, orient='horizontal').pack(fill=tk.X, padx=8, pady=4)
 
@@ -88,6 +90,20 @@ class HandwritingApp:
         self.stroke_width_var = tk.DoubleVar(value=0.25)
         self._add_slider(settings, 'Stroke width (mm):', self.stroke_width_var, 0.1, 1.5, 0.05)
 
+        # Margins
+        margins_frame = ttk.LabelFrame(settings, text='Margins (mm)', padding=4)
+        margins_frame.pack(fill=tk.X, pady=2)
+        self.margin_top_var = tk.IntVar(value=25)
+        self.margin_bottom_var = tk.IntVar(value=25)
+        self.margin_left_var = tk.IntVar(value=20)
+        self.margin_right_var = tk.IntVar(value=20)
+        for label, var in [('Top:', self.margin_top_var), ('Bottom:', self.margin_bottom_var),
+                           ('Left:', self.margin_left_var), ('Right:', self.margin_right_var)]:
+            mf = ttk.Frame(margins_frame)
+            mf.pack(fill=tk.X, pady=1)
+            ttk.Label(mf, text=label, width=7).pack(side=tk.LEFT)
+            ttk.Spinbox(mf, from_=5, to=50, textvariable=var, width=4).pack(side=tk.RIGHT)
+
         # Color
         color_frame = ttk.Frame(settings)
         color_frame.pack(fill=tk.X, pady=2)
@@ -102,6 +118,8 @@ class HandwritingApp:
         self.generate_btn = ttk.Button(btn_frame, text='Generate Handwriting',
                                        command=self._generate, state='disabled')
         self.generate_btn.pack(fill=tk.X, pady=2)
+        ttk.Button(btn_frame, text='Preview PDF',
+                   command=self._preview_pdf).pack(fill=tk.X, pady=2)
         ttk.Button(btn_frame, text='Export SVG...',
                    command=self._export_svg).pack(fill=tk.X, pady=2)
         ttk.Button(btn_frame, text='Export PDF...',
@@ -121,36 +139,20 @@ class HandwritingApp:
         header = ttk.Frame(right)
         header.pack(fill=tk.X, padx=8, pady=(8, 2))
         ttk.Label(header, text='Preview (A4)', font=('', 11, 'bold')).pack(side=tk.LEFT)
-        self._zoom_label = ttk.Label(header, text='', foreground='gray')
-        self._zoom_label.pack(side=tk.RIGHT)
-        ttk.Button(header, text='Fit', width=4,
-                   command=self._zoom_fit).pack(side=tk.RIGHT, padx=(0, 4))
 
-        canvas_frame = ttk.Frame(right)
-        canvas_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+        # Page navigation
+        nav = ttk.Frame(header)
+        nav.pack(side=tk.RIGHT)
+        self._prev_btn = ttk.Button(nav, text='<', width=2, command=self._prev_page)
+        self._prev_btn.pack(side=tk.LEFT)
+        self._page_label = ttk.Label(nav, text='', width=8, anchor='center')
+        self._page_label.pack(side=tk.LEFT, padx=2)
+        self._next_btn = ttk.Button(nav, text='>', width=2, command=self._next_page)
+        self._next_btn.pack(side=tk.LEFT)
 
-        self.canvas = tk.Canvas(canvas_frame, bg='#e0e0e0', highlightthickness=0)
-        self._vscroll = ttk.Scrollbar(canvas_frame, orient=tk.VERTICAL,
-                                      command=self.canvas.yview)
-        self._hscroll = ttk.Scrollbar(canvas_frame, orient=tk.HORIZONTAL,
-                                      command=self.canvas.xview)
-        self.canvas.configure(xscrollcommand=self._hscroll.set,
-                              yscrollcommand=self._vscroll.set)
-
-        self.canvas.grid(row=0, column=0, sticky='nsew')
-        self._vscroll.grid(row=0, column=1, sticky='ns')
-        self._hscroll.grid(row=1, column=0, sticky='ew')
-        canvas_frame.grid_rowconfigure(0, weight=1)
-        canvas_frame.grid_columnconfigure(0, weight=1)
-
+        self.canvas = tk.Canvas(right, bg='#e0e0e0', highlightthickness=0)
+        self.canvas.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
         self.canvas.bind('<Configure>', self._on_canvas_resize)
-        # Scroll-wheel zoom
-        self.canvas.bind('<MouseWheel>', self._on_scroll_zoom)           # macOS / Windows
-        self.canvas.bind('<Button-4>', self._on_scroll_zoom)             # Linux scroll up
-        self.canvas.bind('<Button-5>', self._on_scroll_zoom)             # Linux scroll down
-        # Click-drag panning
-        self.canvas.bind('<ButtonPress-1>', self._on_pan_start)
-        self.canvas.bind('<B1-Motion>', self._on_pan_move)
 
     def _add_slider(self, parent, label, var, from_, to, resolution):
         frame = ttk.Frame(parent)
@@ -185,6 +187,12 @@ class HandwritingApp:
             scale=self.scale_var.get(),
             line_spacing=self.line_spacing_var.get(),
             max_chars_per_line=self.max_chars_var.get(),
+            margins={
+                'top': self.margin_top_var.get(),
+                'bottom': self.margin_bottom_var.get(),
+                'left': self.margin_left_var.get(),
+                'right': self.margin_right_var.get(),
+            },
         )
 
     def _generate(self):
@@ -199,24 +207,26 @@ class HandwritingApp:
             text = self.text_input.get('1.0', 'end-1c')
             renderer = self._get_renderer()
             try:
-                paths, polys, pw, ph = renderer.render(text)
+                pages, pw, ph = renderer.render(text)
                 self.root.after(0, lambda: self._on_render_done(
-                    paths, polys, pw, ph, renderer.color, renderer.stroke_width))
+                    pages, pw, ph, renderer.color, renderer.stroke_width))
             except Exception as e:
                 self.root.after(0, lambda: self._on_render_error(str(e)))
 
         threading.Thread(target=do_render, daemon=True).start()
 
-    def _on_render_done(self, paths, polys, pw, ph, color, stroke_width):
-        self._svg_paths = paths
-        self._polylines = polys
+    def _on_render_done(self, pages, pw, ph, color, stroke_width):
+        self._pages = pages
+        self._current_page = 0
         self._page_w = pw
         self._page_h = ph
         self._render_color = color
         self._render_stroke_width = stroke_width
         self._rendering = False
         self.generate_btn.config(state='normal')
-        self.status_var.set(f'Generated {len(paths)} stroke(s).')
+        total_strokes = sum(len(p['svg_paths']) for p in pages)
+        self.status_var.set(f'Generated {total_strokes} stroke(s) on {len(pages)} page(s).')
+        self._update_page_nav()
         self._draw_preview()
 
     def _on_render_error(self, msg):
@@ -225,90 +235,75 @@ class HandwritingApp:
         self.status_var.set(f'Error: {msg}')
         messagebox.showerror('Render Error', msg)
 
-    def _get_preview_scale(self):
-        """Return the current zoom scale (pixels per mm)."""
-        cw = self.canvas.winfo_width()
-        if cw < 10:
-            return 1.0
-        pw = self._page_w
-        if self._zoom is None:
-            # Fit to width by default
-            return (cw - 2 * PREVIEW_PADDING) / pw
-        return self._zoom
+    def _prev_page(self):
+        if self._current_page > 0:
+            self._current_page -= 1
+            self._update_page_nav()
+            self._draw_preview()
+
+    def _next_page(self):
+        if self._current_page < len(self._pages) - 1:
+            self._current_page += 1
+            self._update_page_nav()
+            self._draw_preview()
+
+    def _update_page_nav(self):
+        n = len(self._pages)
+        if n <= 1:
+            self._page_label.config(text='')
+            self._prev_btn.config(state='disabled')
+            self._next_btn.config(state='disabled')
+        else:
+            self._page_label.config(text=f'{self._current_page + 1} / {n}')
+            self._prev_btn.config(state='normal' if self._current_page > 0 else 'disabled')
+            self._next_btn.config(state='normal' if self._current_page < n - 1 else 'disabled')
 
     def _on_canvas_resize(self, event=None):
-        if self._zoom is None:
-            # Re-fit when in auto mode
-            pass
-        if self._polylines:
+        if self._pages:
             self._draw_preview()
         elif self._model_ready:
             self._draw_empty_page()
 
-    def _on_scroll_zoom(self, event):
-        # Determine scroll direction
-        if event.num == 4:
-            delta = 1
-        elif event.num == 5:
-            delta = -1
-        else:
-            delta = event.delta
+    def _draw_empty_page(self):
+        """Draw an empty A4 page on the canvas."""
+        self.canvas.delete('all')
+        cw = self.canvas.winfo_width()
+        ch = self.canvas.winfo_height()
+        if cw < 10 or ch < 10:
+            return
 
-        factor = 1.15 if delta > 0 else 1 / 1.15
-        old_scale = self._get_preview_scale()
-        new_scale = old_scale * factor
-        # Clamp to reasonable range (0.5x to 20x pixels per mm)
-        new_scale = max(0.5, min(20.0, new_scale))
-        self._zoom = new_scale
-        self._draw_preview() if self._polylines else self._draw_empty_page()
-
-    def _zoom_fit(self):
-        self._zoom = None
-        self._draw_preview() if self._polylines else self._draw_empty_page()
-
-    def _on_pan_start(self, event):
-        self.canvas.scan_mark(event.x, event.y)
-
-    def _on_pan_move(self, event):
-        self.canvas.scan_dragto(event.x, event.y, gain=1)
-
-    def _draw_page(self, scale, pw, ph):
-        """Draw the page background, shadow, and margins at the given scale."""
-        ox = PREVIEW_PADDING
-        oy = PREVIEW_PADDING
+        pw, ph = 210.0, 297.0
+        scale = min((cw - 2 * PREVIEW_PADDING) / pw,
+                    (ch - 2 * PREVIEW_PADDING) / ph)
+        ox = (cw - pw * scale) / 2
+        oy = (ch - ph * scale) / 2
 
         self.canvas.create_rectangle(ox + 3, oy + 3, ox + pw*scale + 3, oy + ph*scale + 3,
                                      fill='#aaa', outline='')
         self.canvas.create_rectangle(ox, oy, ox + pw*scale, oy + ph*scale,
                                      fill='white', outline='#999')
-        return ox, oy
-
-    def _draw_empty_page(self):
-        """Draw an empty A4 page on the canvas."""
-        self.canvas.delete('all')
-        pw, ph = 210.0, 297.0
-        scale = self._get_preview_scale()
-
-        total_w = pw * scale + 2 * PREVIEW_PADDING
-        total_h = ph * scale + 2 * PREVIEW_PADDING
-        self.canvas.configure(scrollregion=(0, 0, total_w, total_h))
-
-        self._draw_page(scale, pw, ph)
-        self._zoom_label.config(text=f'{scale / ((self.canvas.winfo_width() - 2 * PREVIEW_PADDING) / pw) * 100:.0f}%')
 
     def _draw_preview(self):
-        if not hasattr(self, '_polylines'):
+        if not self._pages:
             return
 
         self.canvas.delete('all')
+        cw = self.canvas.winfo_width()
+        ch = self.canvas.winfo_height()
+        if cw < 10 or ch < 10:
+            return
+
         pw, ph = self._page_w, self._page_h
-        scale = self._get_preview_scale()
+        scale = min((cw - 2 * PREVIEW_PADDING) / pw,
+                    (ch - 2 * PREVIEW_PADDING) / ph)
+        ox = (cw - pw * scale) / 2
+        oy = (ch - ph * scale) / 2
 
-        total_w = pw * scale + 2 * PREVIEW_PADDING
-        total_h = ph * scale + 2 * PREVIEW_PADDING
-        self.canvas.configure(scrollregion=(0, 0, total_w, total_h))
-
-        ox, oy = self._draw_page(scale, pw, ph)
+        # Page shadow + background
+        self.canvas.create_rectangle(ox + 3, oy + 3, ox + pw*scale + 3, oy + ph*scale + 3,
+                                     fill='#aaa', outline='')
+        self.canvas.create_rectangle(ox, oy, ox + pw*scale, oy + ph*scale,
+                                     fill='white', outline='#999')
 
         # Margin guides
         renderer = self._get_renderer()
@@ -319,11 +314,12 @@ class HandwritingApp:
         my2 = oy + (ph - m['bottom']) * scale
         self.canvas.create_rectangle(mx1, my1, mx2, my2, outline='#ddd', dash=(4, 4))
 
-        # Draw strokes
+        # Draw strokes for current page
         color = getattr(self, '_render_color', '#1a1a2e')
-        sw = max(1, getattr(self, '_render_stroke_width', 0.4) * scale)
+        sw = max(1, getattr(self, '_render_stroke_width', 0.25) * scale)
 
-        for polyline in self._polylines:
+        page = self._pages[self._current_page]
+        for polyline in page['polylines']:
             if len(polyline) < 2:
                 continue
             coords = []
@@ -332,30 +328,58 @@ class HandwritingApp:
             self.canvas.create_line(*coords, fill=color, width=sw,
                                     smooth=False, capstyle='round', joinstyle='round')
 
-        self._zoom_label.config(text=f'{scale / ((self.canvas.winfo_width() - 2 * PREVIEW_PADDING) / pw) * 100:.0f}%')
-
-    def _export_svg(self):
-        if not self._svg_paths:
+    def _preview_pdf(self):
+        if not self._pages:
             messagebox.showinfo('No Data', 'Generate handwriting first.')
             return
 
-        svg_content = generate_svg(self._svg_paths,
-                                   getattr(self, '_render_color', '#1a1a2e'),
-                                   getattr(self, '_render_stroke_width', 0.4))
+        import subprocess
+        import tempfile
+        tmp = tempfile.NamedTemporaryFile(suffix='.pdf', delete=False, prefix='handwriting_preview_')
+        tmp.close()
+        try:
+            generate_pdf(self._pages, tmp.name,
+                         getattr(self, '_render_color', '#1a1a2e'),
+                         getattr(self, '_render_stroke_width', 0.25))
+            subprocess.Popen(['open', tmp.name])
+        except Exception as e:
+            messagebox.showerror('Preview Error', str(e))
 
-        path = filedialog.asksaveasfilename(
-            title='Save SVG',
-            defaultextension='.svg',
-            filetypes=[('SVG files', '*.svg'), ('All files', '*.*')],
-        )
-        if path:
-            with open(path, 'w', encoding='utf-8') as f:
-                f.write(svg_content)
-            messagebox.showinfo('Exported', f'SVG saved to:\n{path}')
+    def _export_svg(self):
+        if not self._pages:
+            messagebox.showinfo('No Data', 'Generate handwriting first.')
+            return
 
+        color = getattr(self, '_render_color', '#1a1a2e')
+        sw = getattr(self, '_render_stroke_width', 0.4)
+
+        if len(self._pages) == 1:
+            path = filedialog.asksaveasfilename(
+                title='Save SVG',
+                defaultextension='.svg',
+                filetypes=[('SVG files', '*.svg'), ('All files', '*.*')],
+            )
+            if path:
+                with open(path, 'w', encoding='utf-8') as f:
+                    f.write(generate_svg(self._pages[0]['svg_paths'], color, sw))
+                messagebox.showinfo('Exported', f'SVG saved to:\n{path}')
+        else:
+            path = filedialog.asksaveasfilename(
+                title='Save SVGs (page number will be appended)',
+                defaultextension='.svg',
+                filetypes=[('SVG files', '*.svg'), ('All files', '*.*')],
+            )
+            if path:
+                base, ext = os.path.splitext(path)
+                for i, page in enumerate(self._pages):
+                    page_path = f'{base}_{i + 1}{ext}'
+                    with open(page_path, 'w', encoding='utf-8') as f:
+                        f.write(generate_svg(page['svg_paths'], color, sw))
+                messagebox.showinfo('Exported',
+                    f'{len(self._pages)} SVG files saved to:\n{base}_1{ext} ... {base}_{len(self._pages)}{ext}')
 
     def _export_pdf(self):
-        if not self._svg_paths:
+        if not self._pages:
             messagebox.showinfo('No Data', 'Generate handwriting first.')
             return
 
@@ -366,7 +390,7 @@ class HandwritingApp:
         )
         if path:
             try:
-                generate_pdf(self._svg_paths, path,
+                generate_pdf(self._pages, path,
                              getattr(self, '_render_color', '#1a1a2e'),
                              getattr(self, '_render_stroke_width', 0.4))
                 messagebox.showinfo('Exported', f'PDF saved to:\n{path}')
@@ -374,21 +398,39 @@ class HandwritingApp:
                 messagebox.showerror('Export Error', str(e))
 
     def _export_lac(self):
-        if not self._svg_paths:
+        if not self._pages:
             messagebox.showinfo('No Data', 'Generate handwriting first.')
             return
 
-        path = filedialog.asksaveasfilename(
-            title='Save LAC (Bambu Suite)',
-            defaultextension='.lac',
-            filetypes=[('Bambu Suite files', '*.lac'), ('All files', '*.*')],
-        )
-        if path:
-            try:
-                generate_lac(self._svg_paths, path)
-                messagebox.showinfo('Exported', f'LAC saved to:\n{path}')
-            except Exception as e:
-                messagebox.showerror('Export Error', str(e))
+        color = getattr(self, '_render_color', '#1a1a2e')
+
+        if len(self._pages) == 1:
+            path = filedialog.asksaveasfilename(
+                title='Save LAC (Bambu Suite)',
+                defaultextension='.lac',
+                filetypes=[('Bambu Suite files', '*.lac'), ('All files', '*.*')],
+            )
+            if path:
+                try:
+                    generate_lac(self._pages[0]['svg_paths'], path)
+                    messagebox.showinfo('Exported', f'LAC saved to:\n{path}')
+                except Exception as e:
+                    messagebox.showerror('Export Error', str(e))
+        else:
+            path = filedialog.asksaveasfilename(
+                title='Save LAC files (page number will be appended)',
+                defaultextension='.lac',
+                filetypes=[('Bambu Suite files', '*.lac'), ('All files', '*.*')],
+            )
+            if path:
+                try:
+                    base, ext = os.path.splitext(path)
+                    for i, page in enumerate(self._pages):
+                        generate_lac(page['svg_paths'], f'{base}_{i + 1}{ext}')
+                    messagebox.showinfo('Exported',
+                        f'{len(self._pages)} LAC files saved to:\n{base}_1{ext} ... {base}_{len(self._pages)}{ext}')
+                except Exception as e:
+                    messagebox.showerror('Export Error', str(e))
 
 
 def main():

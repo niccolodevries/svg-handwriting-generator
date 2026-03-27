@@ -60,7 +60,7 @@ def sanitize_text(text):
     }
     result = []
     for ch in text:
-        if ch in valid or ch == '\n':
+        if ch in valid or ch in ('\n', '\x00'):
             result.append(ch)
         elif ch in replacements:
             result.append(replacements[ch])
@@ -108,46 +108,107 @@ class HandwritingRenderer:
         self.margins = margins or dict(DEFAULT_MARGINS)
 
     def render(self, text):
-        """Render text and return (svg_paths, polylines, page_w, page_h).
+        """Render text and return (pages, page_w, page_h).
 
-        svg_paths: list of SVG path d-strings
-        polylines: list of [(x,y), ...] for preview
+        pages: list of dicts, each with 'svg_paths' and 'polylines' keys
+
+        Use '---' on its own line to force a page break.
+        Paragraphs are kept together when possible.
         """
+        # Handle page break markers before sanitization
+        PAGE_BREAK = '\x00PAGEBREAK\x00'
+        text = text.replace('\n---\n', f'\n{PAGE_BREAK}\n')
+        # Handle --- at start/end of text too
+        if text.startswith('---\n'):
+            text = PAGE_BREAK + text[3:]
+        if text.endswith('\n---'):
+            text = text[:-3] + PAGE_BREAK
+
         text = sanitize_text(text)
         lines = wrap_text(text, self.max_chars_per_line)
 
         if not lines or all(l.strip() == '' for l in lines):
-            return [], [], A4_WIDTH, A4_HEIGHT
-
-        hand = HandwritingModel.get()
-
-        # Filter out empty lines for the model, track their positions
-        model_lines = []
-        line_indices = []  # maps model output index to page line index
-        for i, line in enumerate(lines):
-            if line.strip():
-                model_lines.append(line)
-                line_indices.append(i)
-
-        if not model_lines:
-            return [], [], A4_WIDTH, A4_HEIGHT
-
-        biases = [self.bias] * len(model_lines)
-        styles = [self.style] * len(model_lines)
-
-        stroke_data = hand.get_stroke_data(model_lines, biases=biases, styles=styles)
-
-        # Convert stroke data to page coordinates
-        svg_paths = []
-        polylines = []
+            return [{'svg_paths': [], 'polylines': []}], A4_WIDTH, A4_HEIGHT
 
         usable_w = A4_WIDTH - self.margins['left'] - self.margins['right']
-
-        # Base line height in mm (tuned for readable handwriting)
         base_line_height = 8.0 * self.scale * self.line_spacing
+        usable_h = A4_HEIGHT - self.margins['top'] - self.margins['bottom']
+        lines_per_page = max(1, int(usable_h / base_line_height))
+
+        # Assign each line a (page, line_on_page) considering:
+        # - paragraphs kept together when possible
+        # - '---' page break markers
+        line_layout = {}  # line_index -> (page_num, line_on_page)
+        cur_page = 0
+        cur_line = 0
+
+        i = 0
+        while i < len(lines):
+            # Page break marker
+            if PAGE_BREAK in lines[i]:
+                if cur_line > 0:
+                    cur_page += 1
+                    cur_line = 0
+                i += 1
+                continue
+
+            # Blank line (paragraph separator)
+            if lines[i].strip() == '':
+                if cur_line > 0:
+                    if cur_line >= lines_per_page:
+                        cur_page += 1
+                        cur_line = 0
+                    else:
+                        line_layout[i] = (cur_page, cur_line)
+                        cur_line += 1
+                i += 1
+                continue
+
+            # Collect paragraph lines (consecutive non-blank, non-pagebreak)
+            para_start = i
+            while (i < len(lines) and lines[i].strip() != ''
+                   and PAGE_BREAK not in lines[i]):
+                i += 1
+            para_len = i - para_start
+
+            # If paragraph doesn't fit on remaining page, move to next page
+            # (unless we're at the top of a page already)
+            if cur_line > 0 and cur_line + para_len > lines_per_page:
+                cur_page += 1
+                cur_line = 0
+
+            # Place paragraph lines
+            for j in range(para_start, i):
+                line_layout[j] = (cur_page, cur_line)
+                cur_line += 1
+                if cur_line >= lines_per_page:
+                    cur_page += 1
+                    cur_line = 0
+
+        # Filter renderable lines (non-empty, non-pagebreak)
+        model_lines = []
+        model_line_indices = []  # index into 'lines' list
+        for idx, line in enumerate(lines):
+            if line.strip() and PAGE_BREAK not in line and idx in line_layout:
+                model_lines.append(line)
+                model_line_indices.append(idx)
+
+        if not model_lines:
+            return [{'svg_paths': [], 'polylines': []}], A4_WIDTH, A4_HEIGHT
+
+        hand = HandwritingModel.get()
+        biases = [self.bias] * len(model_lines)
+        styles = [self.style] * len(model_lines)
+        stroke_data = hand.get_stroke_data(model_lines, biases=biases, styles=styles)
+
+        pages = [{'svg_paths': [], 'polylines': []}]
 
         for data_idx, offsets in enumerate(stroke_data):
-            page_line_idx = line_indices[data_idx]
+            line_idx = model_line_indices[data_idx]
+            page_num, line_on_page = line_layout[line_idx]
+
+            while page_num >= len(pages):
+                pages.append({'svg_paths': [], 'polylines': []})
 
             offsets = offsets.copy()
             offsets[:, :2] *= 1.5
@@ -156,10 +217,8 @@ class HandwritingRenderer:
             coords = synth_drawing.denoise(coords)
             coords[:, :2] = synth_drawing.align(coords[:, :2])
 
-            # Flip Y
             coords[:, 1] *= -1
 
-            # Normalize to bounding box
             x_min, y_min = coords[:, 0].min(), coords[:, 1].min()
             x_max, y_max = coords[:, 0].max(), coords[:, 1].max()
             raw_w = x_max - x_min
@@ -168,20 +227,13 @@ class HandwritingRenderer:
             if raw_w < 1 or raw_h < 1:
                 continue
 
-            # Scale to fit usable width
             fit_scale = min(usable_w / raw_w, base_line_height / raw_h) * self.scale
-            # Don't exceed usable width
             if raw_w * fit_scale > usable_w:
                 fit_scale = usable_w / raw_w
 
-            # Position on page
             x_offset = self.margins['left']
-            y_offset = self.margins['top'] + (page_line_idx + 1) * base_line_height
+            y_offset = self.margins['top'] + (line_on_page + 1) * base_line_height
 
-            if y_offset + base_line_height > A4_HEIGHT - self.margins['bottom']:
-                break  # off page
-
-            # Build path
             path_parts = []
             flat_points = []
             prev_eos = 1.0
@@ -193,7 +245,7 @@ class HandwritingRenderer:
                 if prev_eos == 1.0:
                     path_parts.append(f'M{px:.2f},{py:.2f}')
                     if flat_points:
-                        polylines.append(flat_points)
+                        pages[page_num]['polylines'].append(flat_points)
                         flat_points = []
                 else:
                     path_parts.append(f'L{px:.2f},{py:.2f}')
@@ -202,11 +254,11 @@ class HandwritingRenderer:
                 prev_eos = eos
 
             if flat_points:
-                polylines.append(flat_points)
+                pages[page_num]['polylines'].append(flat_points)
 
-            svg_paths.append(' '.join(path_parts))
+            pages[page_num]['svg_paths'].append(' '.join(path_parts))
 
-        return svg_paths, polylines, A4_WIDTH, A4_HEIGHT
+        return pages, A4_WIDTH, A4_HEIGHT
 
 
 def generate_svg(svg_paths, color='#1a1a2e', stroke_width=0.4):
@@ -231,70 +283,77 @@ def generate_svg(svg_paths, color='#1a1a2e', stroke_width=0.4):
     return '\n'.join(lines)
 
 
-def generate_pdf(svg_paths, output_path, color='#1a1a2e', stroke_width=0.4):
-    """Generate a PDF file with the handwriting paths.
+def generate_pdf(pages, output_path, color='#1a1a2e', stroke_width=0.4):
+    """Generate a multi-page PDF file with the handwriting paths.
 
+    pages: list of dicts with 'svg_paths' key (one per page)
     Produces a minimal valid PDF directly — no external libraries needed.
     """
-    # Convert mm to PDF points (1 mm = 72/25.4 points)
     mm2pt = 72.0 / 25.4
     page_w = A4_WIDTH * mm2pt
     page_h = A4_HEIGHT * mm2pt
 
-    # Parse hex color to RGB (0-1 range)
     c = color.lstrip('#')
     r, g, b = int(c[0:2], 16) / 255, int(c[2:4], 16) / 255, int(c[4:6], 16) / 255
 
-    # Build PDF content stream — draw all paths
-    stream_parts = [
-        # Set stroke color, width, line caps/joins
-        f'{r:.4f} {g:.4f} {b:.4f} RG',
-        f'{stroke_width * mm2pt:.4f} w',
-        '1 J',  # round line cap
-        '1 j',  # round line join
-    ]
+    # Build content stream for each page
+    page_streams = []
+    for page in pages:
+        stream_parts = [
+            f'{r:.4f} {g:.4f} {b:.4f} RG',
+            f'{stroke_width * mm2pt:.4f} w',
+            '1 J', '1 j',
+        ]
+        for path_d in page['svg_paths']:
+            if not path_d:
+                continue
+            for part in path_d.split():
+                if part.startswith('M'):
+                    coords = part[1:].split(',')
+                    x = float(coords[0]) * mm2pt
+                    y = page_h - float(coords[1]) * mm2pt
+                    stream_parts.append(f'{x:.4f} {y:.4f} m')
+                elif part.startswith('L'):
+                    coords = part[1:].split(',')
+                    x = float(coords[0]) * mm2pt
+                    y = page_h - float(coords[1]) * mm2pt
+                    stream_parts.append(f'{x:.4f} {y:.4f} l')
+            stream_parts.append('S')
+        page_streams.append('\n'.join(stream_parts).encode('latin-1'))
 
-    for path_d in svg_paths:
-        if not path_d:
-            continue
-        for part in path_d.split():
-            if part.startswith('M'):
-                coords = part[1:].split(',')
-                # PDF Y-axis is bottom-up, so flip: pdf_y = page_h - svg_y * mm2pt
-                x = float(coords[0]) * mm2pt
-                y = page_h - float(coords[1]) * mm2pt
-                stream_parts.append(f'{x:.4f} {y:.4f} m')
-            elif part.startswith('L'):
-                coords = part[1:].split(',')
-                x = float(coords[0]) * mm2pt
-                y = page_h - float(coords[1]) * mm2pt
-                stream_parts.append(f'{x:.4f} {y:.4f} l')
-        stream_parts.append('S')  # stroke the path
+    num_pages = len(page_streams)
 
-    stream = '\n'.join(stream_parts)
-    stream_bytes = stream.encode('latin-1')
-
-    # Build minimal PDF structure
+    # PDF objects:
+    # 1 = Catalog, 2 = Pages
+    # Then for each page: Page obj + Stream obj (ids 3,4 then 5,6 etc.)
     objects = []
 
     # Object 1: Catalog
     objects.append(b'1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj')
-    # Object 2: Pages
-    objects.append(b'2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj')
-    # Object 3: Page
+
+    # Object 2: Pages — kids are page objects at ids 3, 5, 7, ...
+    kids = ' '.join(f'{3 + i * 2} 0 R' for i in range(num_pages))
     objects.append(
-        f'3 0 obj\n<< /Type /Page /Parent 2 0 R '
-        f'/MediaBox [0 0 {page_w:.4f} {page_h:.4f}] '
-        f'/Contents 4 0 R >>\nendobj'.encode('latin-1')
-    )
-    # Object 4: Content stream
-    objects.append(
-        f'4 0 obj\n<< /Length {len(stream_bytes)} >>\nstream\n'.encode('latin-1')
-        + stream_bytes
-        + b'\nendstream\nendobj'
+        f'2 0 obj\n<< /Type /Pages /Kids [{kids}] /Count {num_pages} >>\nendobj'
+        .encode('latin-1')
     )
 
-    # Write PDF
+    # Page + stream object pairs
+    for i, stream_bytes in enumerate(page_streams):
+        page_obj_id = 3 + i * 2
+        stream_obj_id = 4 + i * 2
+        objects.append(
+            f'{page_obj_id} 0 obj\n<< /Type /Page /Parent 2 0 R '
+            f'/MediaBox [0 0 {page_w:.4f} {page_h:.4f}] '
+            f'/Contents {stream_obj_id} 0 R >>\nendobj'.encode('latin-1')
+        )
+        objects.append(
+            f'{stream_obj_id} 0 obj\n<< /Length {len(stream_bytes)} >>\nstream\n'
+            .encode('latin-1')
+            + stream_bytes
+            + b'\nendstream\nendobj'
+        )
+
     with open(output_path, 'wb') as f:
         f.write(b'%PDF-1.4\n')
         offsets = []
@@ -302,13 +361,11 @@ def generate_pdf(svg_paths, output_path, color='#1a1a2e', stroke_width=0.4):
             offsets.append(f.tell())
             f.write(obj)
             f.write(b'\n')
-        # Cross-reference table
         xref_offset = f.tell()
         f.write(f'xref\n0 {len(objects) + 1}\n'.encode('latin-1'))
         f.write(b'0000000000 65535 f \n')
         for off in offsets:
             f.write(f'{off:010d} 00000 n \n'.encode('latin-1'))
-        # Trailer
         f.write(
             f'trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n'
             f'startxref\n{xref_offset}\n%%EOF\n'.encode('latin-1')
