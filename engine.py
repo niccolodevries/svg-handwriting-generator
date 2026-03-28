@@ -1,19 +1,11 @@
 """Handwriting rendering engine using neural handwriting synthesis.
 
-Wraps the sjvasquez/handwriting-synthesis RNN model to generate
+Wraps a PyTorch RNN model (Graves architecture) to generate
 realistic single-stroke handwriting on A4 pages.
 """
 
 import os
 import sys
-import warnings
-
-# TF setup must happen before any TF imports
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-os.environ['TF_USE_LEGACY_KERAS'] = '1'
-
-import logging
-logging.getLogger('tensorflow').setLevel(logging.ERROR)
 
 import numpy as np
 
@@ -38,10 +30,8 @@ class HandwritingModel:
     @classmethod
     def get(cls):
         if cls._instance is None:
-            with warnings.catch_warnings():
-                warnings.simplefilter('ignore')
-                from demo import Hand
-                cls._instance = Hand()
+            from demo import Hand
+            cls._instance = Hand()
         return cls._instance
 
 
@@ -201,22 +191,16 @@ class HandwritingRenderer:
         styles = [self.style] * len(model_lines)
         stroke_data = hand.get_stroke_data(model_lines, biases=biases, styles=styles)
 
-        pages = [{'svg_paths': [], 'polylines': []}]
-
-        for data_idx, offsets in enumerate(stroke_data):
-            line_idx = model_line_indices[data_idx]
-            page_num, line_on_page = line_layout[line_idx]
-
-            while page_num >= len(pages):
-                pages.append({'svg_paths': [], 'polylines': []})
-
+        # First pass: process all strokes and compute a consistent scale
+        processed = []
+        raw_heights = []
+        for offsets in stroke_data:
             offsets = offsets.copy()
             offsets[:, :2] *= 1.5
 
             coords = synth_drawing.offsets_to_coords(offsets)
             coords = synth_drawing.denoise(coords)
             coords[:, :2] = synth_drawing.align(coords[:, :2])
-
             coords[:, 1] *= -1
 
             x_min, y_min = coords[:, 0].min(), coords[:, 1].min()
@@ -224,12 +208,43 @@ class HandwritingRenderer:
             raw_w = x_max - x_min
             raw_h = y_max - y_min
 
-            if raw_w < 1 or raw_h < 1:
+            processed.append({
+                'coords': coords,
+                'x_min': x_min, 'y_min': y_min,
+                'raw_w': raw_w, 'raw_h': raw_h,
+            })
+            if raw_h > 1:
+                raw_heights.append(raw_h)
+
+        if not raw_heights:
+            return [{'svg_paths': [], 'polylines': []}], A4_WIDTH, A4_HEIGHT
+
+        # Use median height for consistent character sizing across all lines
+        median_h = float(np.median(raw_heights))
+        uniform_scale = (base_line_height / median_h) * self.scale
+
+        # Second pass: render with consistent scale
+        pages = [{'svg_paths': [], 'polylines': []}]
+
+        for data_idx, line_data in enumerate(processed):
+            line_idx = model_line_indices[data_idx]
+            page_num, line_on_page = line_layout[line_idx]
+
+            while page_num >= len(pages):
+                pages.append({'svg_paths': [], 'polylines': []})
+
+            if line_data['raw_w'] < 1 or line_data['raw_h'] < 1:
                 continue
 
-            fit_scale = min(usable_w / raw_w, base_line_height / raw_h) * self.scale
-            if raw_w * fit_scale > usable_w:
-                fit_scale = usable_w / raw_w
+            coords = line_data['coords']
+            x_min = line_data['x_min']
+            y_min = line_data['y_min']
+            raw_w = line_data['raw_w']
+
+            # Use uniform scale, but clamp if line would overflow page width
+            scale = uniform_scale
+            if raw_w * scale > usable_w:
+                scale = usable_w / raw_w
 
             x_offset = self.margins['left']
             y_offset = self.margins['top'] + (line_on_page + 1) * base_line_height
@@ -239,8 +254,8 @@ class HandwritingRenderer:
             prev_eos = 1.0
 
             for x, y, eos in zip(coords[:, 0], coords[:, 1], coords[:, 2]):
-                px = x_offset + (x - x_min) * fit_scale
-                py = y_offset + (y - y_min) * fit_scale
+                px = x_offset + (x - x_min) * scale
+                py = y_offset + (y - y_min) * scale
 
                 if prev_eos == 1.0:
                     path_parts.append(f'M{px:.2f},{py:.2f}')

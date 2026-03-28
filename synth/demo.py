@@ -1,64 +1,44 @@
 import os
-import sys
 import logging
 
 import numpy as np
+import torch
 import svgwrite
 
-# Ensure synth directory is on the path and is the working dir for checkpoints
 _synth_dir = os.path.dirname(os.path.abspath(__file__))
 
 import drawing
-from rnn import rnn
+from model import HandwritingSynthesisModel
 
 
 class Hand(object):
 
     def __init__(self):
-        os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-        self.nn = rnn(
-            log_dir=os.path.join(_synth_dir, 'logs'),
-            checkpoint_dir=os.path.join(_synth_dir, 'checkpoints'),
-            prediction_dir=os.path.join(_synth_dir, 'predictions'),
-            learning_rates=[.0001, .00005, .00002],
-            batch_sizes=[32, 64, 64],
-            patiences=[1500, 1000, 500],
-            beta1_decays=[.9, .9, .9],
-            validation_batch_size=32,
-            optimizer='rms',
-            num_training_steps=100000,
-            warm_start_init_step=17900,
-            regularization_constant=0.0,
-            keep_prob=1.0,
-            enable_parameter_averaging=False,
-            min_steps_to_checkpoint=2000,
-            log_interval=20,
-            logging_level=logging.CRITICAL,
-            grad_clip=10,
+        self.device = 'cpu'
+        self.model = HandwritingSynthesisModel(
             lstm_size=400,
-            output_mixture_components=20,
-            attention_mixture_components=10
+            num_attn_mixture_components=10,
+            num_output_mixture_components=20,
+            vocab_size=len(drawing.alphabet),
         )
-        self.nn.restore()
+        checkpoint_path = os.path.join(_synth_dir, 'checkpoints', 'model.pt')
+        state_dict = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
+        self.model.load_state_dict(state_dict)
+        self.model.eval()
 
     def write(self, filename, lines, biases=None, styles=None, stroke_colors=None, stroke_widths=None):
         valid_char_set = set(drawing.alphabet)
         for line_num, line in enumerate(lines):
             if len(line) > 75:
                 raise ValueError(
-                    (
-                        "Each line must be at most 75 characters. "
-                        "Line {} contains {}"
-                    ).format(line_num, len(line))
+                    "Each line must be at most 75 characters. "
+                    "Line {} contains {}".format(line_num, len(line))
                 )
-
             for char in line:
                 if char not in valid_char_set:
                     raise ValueError(
-                        (
-                            "Invalid character {} detected in line {}. "
-                            "Valid character set is {}"
-                        ).format(char, line_num, valid_char_set)
+                        "Invalid character {} detected in line {}. "
+                        "Valid character set is {}".format(char, line_num, valid_char_set)
                     )
 
         strokes = self._sample(lines, biases=biases, styles=styles)
@@ -66,8 +46,8 @@ class Hand(object):
 
     def _sample(self, lines, biases=None, styles=None):
         num_samples = len(lines)
-        max_tsteps = 40*max([len(i) for i in lines])
-        biases = biases if biases is not None else [0.5]*num_samples
+        max_tsteps = 40 * max(len(i) for i in lines)
+        biases = biases if biases is not None else [0.5] * num_samples
 
         x_prime = np.zeros([num_samples, 1200, 3])
         x_prime_len = np.zeros([num_samples])
@@ -88,44 +68,41 @@ class Hand(object):
                 x_prime_len[i] = len(x_p)
                 chars[i, :len(c_p)] = c_p
                 chars_len[i] = len(c_p)
-
         else:
             for i in range(num_samples):
                 encoded = drawing.encode_ascii(lines[i])
                 chars[i, :len(encoded)] = encoded
                 chars_len[i] = len(encoded)
 
-        [samples] = self.nn.session.run(
-            [self.nn.sampled_sequence],
-            feed_dict={
-                self.nn.prime: styles is not None,
-                self.nn.x_prime: x_prime,
-                self.nn.x_prime_len: x_prime_len,
-                self.nn.num_samples: num_samples,
-                self.nn.sample_tsteps: max_tsteps,
-                self.nn.c: chars,
-                self.nn.c_len: chars_len,
-                self.nn.bias: biases
-            }
+        # Convert to tensors
+        chars_t = torch.from_numpy(chars).long().to(self.device)
+        chars_len_t = torch.from_numpy(chars_len).int().to(self.device)
+        bias_t = torch.tensor(biases, dtype=torch.float32, device=self.device)
+
+        prime = styles is not None
+        x_prime_t = torch.from_numpy(x_prime).float().to(self.device) if prime else None
+        x_prime_len_t = torch.from_numpy(x_prime_len).int().to(self.device) if prime else None
+
+        samples = self.model.sample(
+            chars_t, chars_len_t, bias_t, max_tsteps,
+            prime=prime, x_prime=x_prime_t, x_prime_len=x_prime_len_t,
         )
-        samples = [sample[~np.all(sample == 0.0, axis=1)] for sample in samples]
         return samples
 
     def _draw(self, strokes, lines, filename, stroke_colors=None, stroke_widths=None):
-        stroke_colors = stroke_colors or ['black']*len(lines)
-        stroke_widths = stroke_widths or [2]*len(lines)
+        stroke_colors = stroke_colors or ['black'] * len(lines)
+        stroke_widths = stroke_widths or [2] * len(lines)
 
         line_height = 60
         view_width = 1000
-        view_height = line_height*(len(strokes) + 1)
+        view_height = line_height * (len(strokes) + 1)
 
         dwg = svgwrite.Drawing(filename=filename)
         dwg.viewbox(width=view_width, height=view_height)
         dwg.add(dwg.rect(insert=(0, 0), size=(view_width, view_height), fill='white'))
 
-        initial_coord = np.array([0, -(3*line_height / 4)])
+        initial_coord = np.array([0, -(3 * line_height / 4)])
         for offsets, line, color, width in zip(strokes, lines, stroke_colors, stroke_widths):
-
             if not line:
                 initial_coord[1] -= line_height
                 continue
@@ -156,6 +133,5 @@ class Hand(object):
         """Return raw stroke data as list of numpy arrays (one per line).
 
         Each array has shape (N, 3) with columns [dx, dy, end_of_stroke].
-        This is useful for custom rendering (e.g., A4 layout).
         """
         return self._sample(lines, biases=biases, styles=styles)

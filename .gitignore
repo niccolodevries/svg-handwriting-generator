@@ -8,4 +8,7 @@ build/
 *.svg
 synth/logs/
 synth/predictions/
+synth/data/
+test_output/
+*.lac
 .DS_Store
